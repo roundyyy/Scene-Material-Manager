@@ -1,6 +1,7 @@
 using UnityEngine;
 using UnityEditor;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 
 public class SceneMaterialManager : EditorWindow
@@ -21,6 +22,12 @@ public class SceneMaterialManager : EditorWindow
     private bool showTextureWarnings = true;
     private SearchMode currentSearchMode = SearchMode.MaterialAndShader;
 
+    private Material materialToClean = null;
+    private bool needsRefresh = false;
+    private bool createBackups = true;
+    private bool previewMode = true;
+    private List<Material> materialsToClean = new List<Material>();
+
     private enum SearchMode
     {
         MaterialAndShader,
@@ -30,7 +37,7 @@ public class SceneMaterialManager : EditorWindow
     [MenuItem("Tools/Roundy/Scene Material Manager")]
     public static void ShowWindow()
     {
-        GetWindow<SceneMaterialManager>("Scene Material Manager");
+        GetWindow<SceneMaterialManager>("Scene Material Manager v0.2");
     }
 
     private void InitializeStyles()
@@ -64,6 +71,7 @@ public class SceneMaterialManager : EditorWindow
         dict[key] = value;
     }
 
+
     private void OnGUI()
     {
         InitializeStyles();
@@ -80,25 +88,96 @@ public class SceneMaterialManager : EditorWindow
 
     private void DrawToolbar()
     {
-        GUILayout.BeginHorizontal(EditorStyles.toolbar);
+        // Main toolbar
+        EditorGUILayout.BeginHorizontal(EditorStyles.toolbar);
         {
-            GUILayout.Space(5);
+            GUILayout.Space(5); // Add space before the first button
             if (GUILayout.Button("Refresh Materials", EditorStyles.toolbarButton, GUILayout.Width(120)))
             {
                 FindMaterialsInScene();
             }
-
             GUILayout.Space(10);
-            showTextureWarnings = GUILayout.Toggle(showTextureWarnings, "Show Texture Warnings", EditorStyles.toolbarButton);
+            includeInactive = GUILayout.Toggle(includeInactive, "Include Inactive", EditorStyles.toolbarButton, GUILayout.Width(100));
 
             GUILayout.FlexibleSpace();
 
-            includeInactive = GUILayout.Toggle(includeInactive, "Include Inactive", EditorStyles.toolbarButton, GUILayout.Width(100));
+            showTextureWarnings = GUILayout.Toggle(showTextureWarnings, "Show Texture Warnings", EditorStyles.toolbarButton);
             GUILayout.Space(5);
         }
-        GUILayout.EndHorizontal();
-    }
+        EditorGUILayout.EndHorizontal();
 
+        // Cleanup settings bar
+        EditorGUILayout.BeginHorizontal(EditorStyles.toolbar);
+        {
+            GUILayout.Space(5);
+            GUILayout.Label("Cleanup Settings:", EditorStyles.boldLabel, GUILayout.Width(110));
+
+            using (new EditorGUI.IndentLevelScope())
+            {
+                var color = GUI.color;
+
+                // Preview mode toggle with color indication and wider width
+                GUI.color = previewMode ? new Color(0.85f, 1f, 0.85f) : color;
+                previewMode = EditorGUILayout.ToggleLeft(
+                    new GUIContent("Preview Mode", "When enabled, shows what would be cleaned without making actual changes"),
+                    previewMode,
+                    GUILayout.Width(120)
+                );
+
+                GUILayout.Space(10);
+
+                // Backup toggle with wider width
+                GUI.color = createBackups ? new Color(0.85f, 1f, 0.85f) : color;
+                createBackups = EditorGUILayout.ToggleLeft(
+                    new GUIContent("Create Backups", "Creates .backup files before cleaning materials"),
+                    createBackups,
+                    GUILayout.Width(120)
+                );
+
+                GUI.color = color;
+            }
+
+            GUILayout.FlexibleSpace();
+
+            // Action buttons
+            if (GUILayout.Button(new GUIContent("Clean All Materials",
+                "Removes unused properties from all materials to reduce build size"),
+                EditorStyles.toolbarButton, GUILayout.Width(120)))
+            {
+                if (EditorUtility.DisplayDialog("Clean All Materials",
+                    $"Clean all materials in the scene?\n\n" +
+                    $"Mode: {(previewMode ? "Preview (no changes)" : "Apply Changes")}\n" +
+                    $"Backups: {(createBackups ? "Enabled" : "Disabled")}\n\n" +
+                    "This will:\n" +
+                    "• Remove unused properties\n" +
+                    "• Clean shader caches\n" +
+                    "• Reduce build size\n",
+                    previewMode ? "Preview Clean" : "Clean All",
+                    "Cancel"))
+                {
+                    foreach (var shaderGroup in materialsByShader)
+                    {
+                        materialsToClean.AddRange(shaderGroup.Value);
+                    }
+                }
+            }
+
+            GUILayout.Space(10);
+
+            using (new EditorGUI.DisabledGroupScope(!createBackups))
+            {
+                if (GUILayout.Button("Restore Backups",
+                    EditorStyles.toolbarButton, GUILayout.Width(100)))
+                {
+                    RestoreAllBackups();
+                }
+            }
+            GUILayout.Space(5);
+        }
+        EditorGUILayout.EndHorizontal();
+
+        EditorGUILayout.Space(2);
+    }
     private void DrawSearchBar()
     {
         EditorGUILayout.BeginHorizontal(EditorStyles.toolbar);
@@ -256,6 +335,38 @@ public class SceneMaterialManager : EditorWindow
             EditorGUILayout.LabelField(material.name, EditorStyles.boldLabel);
             GUILayout.FlexibleSpace();
 
+            // Modified cleanup button
+            if (GUILayout.Button(new GUIContent("Cleanup", "Clean unused shader properties to reduce build size"), EditorStyles.miniButton, GUILayout.Width(70)))
+            {
+                if (EditorUtility.DisplayDialog("Clean Material Properties",
+                    "This will:\n" +
+                    "1. Remove all unused property references\n" +
+                    "2. Clean cached shader properties\n" +
+                    "3. Restore only currently used properties\n\n" +
+                    "This helps reduce build size and clear old cached data.\n\n" +
+                    "Do you want to proceed?",
+                    "Clean", "Cancel"))
+                {
+                    materialToClean = material;
+                }
+            }
+
+            if (GUILayout.Button(new GUIContent("?", "What does cleanup do?\n\n" +
+                "• Removes unused property references\n" +
+                "• Cleans shader property cache\n" +
+                "• Reduces build size\n" +
+                "• Keeps only active properties\n\n" +
+                "Use this when:\n" +
+                "• Changing shaders\n" +
+                "• Reducing build size\n" +
+                "• Fixing material issues"), EditorStyles.miniButton, GUILayout.Width(20)))
+            {
+                // Button just shows tooltip
+            }
+
+            GUILayout.Space(5);
+
+            // Original buttons
             if (GUILayout.Button("Duplicate", EditorStyles.miniButton, GUILayout.Width(70)))
             {
                 DuplicateMaterial(material);
@@ -281,6 +392,8 @@ public class SceneMaterialManager : EditorWindow
             GUILayout.Space(5);
         }
     }
+
+
 
     private void DrawMaterialPath(Material material)
     {
@@ -367,6 +480,35 @@ public class SceneMaterialManager : EditorWindow
             }
         }
         EditorGUI.indentLevel--;
+    }
+    private void Update()
+    {
+        if (materialsToClean.Count > 0)
+        {
+            var material = materialsToClean[0];
+            materialsToClean.RemoveAt(0);
+
+            if (material != null)
+            {
+                CleanupMaterial(material);
+                EditorUtility.SetDirty(material);
+
+                if (materialsToClean.Count == 0)
+                {
+                    AssetDatabase.SaveAssets();
+                    needsRefresh = true;
+                }
+            }
+
+            Repaint();
+        }
+
+        if (needsRefresh)
+        {
+            FindMaterialsInScene();
+            needsRefresh = false;
+            Repaint();
+        }
     }
 
     private void DuplicateMaterial(Material sourceMaterial)
@@ -487,6 +629,188 @@ public class SceneMaterialManager : EditorWindow
 
         EditorGUI.indentLevel--;
     }
+    private void CleanupMaterial(Material material)
+    {
+        if (previewMode)
+        {
+            Debug.Log($"Preview Mode: Would clean {material.name}");
+            return;
+        }
+
+        string originalPath = AssetDatabase.GetAssetPath(material);
+        if (string.IsNullOrEmpty(originalPath))
+        {
+            Debug.LogError($"Cannot clean material {material.name} - it's not saved as an asset");
+            return;
+        }
+
+        if (createBackups)
+        {
+            CreateMaterialBackup(material);
+        }
+
+        Shader currentShader = material.shader;
+        SerializedObject serializedMaterial = new SerializedObject(material);
+
+        try
+        {
+            // Store current property values we want to keep
+            Dictionary<string, object> propertiesToKeep = new Dictionary<string, object>();
+            int propertyCount = ShaderUtil.GetPropertyCount(currentShader);
+
+            for (int i = 0; i < propertyCount; i++)
+            {
+                string propertyName = ShaderUtil.GetPropertyName(currentShader, i);
+                var propertyType = ShaderUtil.GetPropertyType(currentShader, i);
+
+                if (!material.HasProperty(propertyName)) continue;
+
+                switch (propertyType)
+                {
+                    case ShaderUtil.ShaderPropertyType.Color:
+                        propertiesToKeep[propertyName] = material.GetColor(propertyName);
+                        break;
+                    case ShaderUtil.ShaderPropertyType.Vector:
+                        propertiesToKeep[propertyName] = material.GetVector(propertyName);
+                        break;
+                    case ShaderUtil.ShaderPropertyType.Float:
+                    case ShaderUtil.ShaderPropertyType.Range:
+                        propertiesToKeep[propertyName] = material.GetFloat(propertyName);
+                        break;
+                    case ShaderUtil.ShaderPropertyType.TexEnv:
+                        var texture = material.GetTexture(propertyName);
+                        if (texture != null) propertiesToKeep[propertyName] = texture;
+
+                        // Save texture scale/offset
+                        string stName = propertyName + "_ST";
+                        if (material.HasProperty(stName))
+                        {
+                            propertiesToKeep[stName] = material.GetTextureScale(propertyName);
+                            propertiesToKeep[stName + "_OFFSET"] = material.GetTextureOffset(propertyName);
+                        }
+                        break;
+                }
+            }
+
+            // Clear the material's saved properties
+            SerializedProperty savedProps = serializedMaterial.FindProperty("m_SavedProperties");
+            if (savedProps != null)
+            {
+                SerializedProperty texProps = savedProps.FindPropertyRelative("m_TexEnvs");
+                SerializedProperty floatProps = savedProps.FindPropertyRelative("m_Floats");
+                SerializedProperty colorProps = savedProps.FindPropertyRelative("m_Colors");
+
+                if (texProps != null) texProps.ClearArray();
+                if (floatProps != null) floatProps.ClearArray();
+                if (colorProps != null) colorProps.ClearArray();
+
+                serializedMaterial.ApplyModifiedProperties();
+            }
+
+            // Reset the shader to force Unity to clear the cached properties
+            Shader tempShader = Shader.Find("Standard");
+            material.shader = tempShader;
+            material.shader = currentShader;
+
+            // Restore only the properties we want to keep
+            foreach (var prop in propertiesToKeep)
+            {
+                if (!material.HasProperty(prop.Key)) continue;
+
+                if (prop.Value is Color color)
+                    material.SetColor(prop.Key, color);
+                else if (prop.Value is Vector4 vector)
+                    material.SetVector(prop.Key, vector);
+                else if (prop.Value is float floatVal)
+                    material.SetFloat(prop.Key, floatVal);
+                else if (prop.Value is Texture texture)
+                {
+                    material.SetTexture(prop.Key, texture);
+                    // Restore texture scale/offset
+                    string stKey = prop.Key + "_ST";
+                    if (propertiesToKeep.ContainsKey(stKey))
+                    {
+                        material.SetTextureScale(prop.Key, (Vector2)propertiesToKeep[stKey]);
+                        material.SetTextureOffset(prop.Key, (Vector2)propertiesToKeep[stKey + "_OFFSET"]);
+                    }
+                }
+            }
+
+            EditorUtility.SetDirty(material);
+            AssetDatabase.SaveAssets();
+        }
+        finally
+        {
+            serializedMaterial.Dispose();
+        }
+    }
+
+    private void CreateMaterialBackup(Material material)
+    {
+        string originalPath = AssetDatabase.GetAssetPath(material);
+        string backupPath = originalPath + ".backup";
+
+        if (!File.Exists(backupPath))
+        {
+            AssetDatabase.CopyAsset(originalPath, backupPath);
+        }
+    }
+
+    private void RestoreBackup(string originalPath)
+    {
+        string backupPath = originalPath + ".backup";
+
+        if (File.Exists(backupPath))
+        {
+            if (EditorUtility.DisplayDialog("Restore Backup",
+                $"Are you sure you want to restore the backup for {Path.GetFileName(originalPath)}?",
+                "Restore", "Cancel"))
+            {
+                File.Copy(backupPath, originalPath, true);
+                AssetDatabase.Refresh();
+                Debug.Log($"Restored backup for {originalPath}");
+                needsRefresh = true;
+            }
+        }
+        else
+        {
+            EditorUtility.DisplayDialog("Error",
+                $"No backup found for {Path.GetFileName(originalPath)}", "OK");
+        }
+    }
+    private void RestoreAllBackups()
+    {
+        if (EditorUtility.DisplayDialog("Restore All Backups",
+            "Are you sure you want to restore all material backups?\nThis will revert all changes.",
+            "Restore All", "Cancel"))
+        {
+            int restoredCount = 0;
+            foreach (var shaderGroup in materialsByShader)
+            {
+                foreach (var material in shaderGroup.Value)
+                {
+                    string path = AssetDatabase.GetAssetPath(material);
+                    string backupPath = path + ".backup";
+                    if (File.Exists(backupPath))
+                    {
+                        File.Copy(backupPath, path, true);
+                        restoredCount++;
+                    }
+                }
+            }
+
+            if (restoredCount > 0)
+            {
+                AssetDatabase.Refresh();
+                Debug.Log($"Restored {restoredCount} material backups");
+                needsRefresh = true;
+            }
+            else
+            {
+                EditorUtility.DisplayDialog("No Backups", "No backup files found to restore.", "OK");
+            }
+        }
+    }
 
     private List<string> GetMaterialTextures(Material material)
     {
@@ -534,7 +858,7 @@ public class SceneMaterialManager : EditorWindow
 
         Renderer[] renderers = includeInactive
             ? Resources.FindObjectsOfTypeAll<Renderer>()
-            : FindObjectsOfType<Renderer>();
+            : FindObjectsByType<Renderer>(FindObjectsSortMode.None);
 
         foreach (Renderer renderer in renderers)
         {
